@@ -34,7 +34,7 @@ import sys
 import time
 from datetime import datetime, timezone
 from pathlib import Path
-from urllib.parse import parse_qs, urlparse
+from urllib.parse import parse_qs, unquote, urlparse
 
 import requests
 from bs4 import BeautifulSoup, Tag
@@ -278,18 +278,41 @@ def scrape_shelf(c: Client, item: dict) -> dict:
     return {"name": item["name"], "books": rows}
 
 
+def shelf_names_from(links) -> list[str]:
+    """Shelf/tag names from anchor hrefs, URL-decoded, de-duplicated, minus the '#ALL#' pseudo-shelf."""
+    names: list[str] = []
+    for a in links:
+        m = re.search(r"[?&](?:shelf|tag)=([^&]+)", a.get("href", ""))
+        name = unquote(m.group(1)) if m else ""
+        if name and name != "#ALL#" and name not in names:
+            names.append(name)
+    return names
+
+
+def profile_from_shelf_page(c: Client, user_id: str) -> tuple[str, list[str]]:
+    """Fallback for accounts whose /user/show page redirects to an author page: use the My Books page."""
+    soup = c.soup(f"{BASE}/review/list/{user_id}")
+    m = re.match(r"^(.*?)[\u2019']s books on Goodreads", soup.title.get_text().strip() if soup.title else "")
+    sidebar = soup.find(id="paginatedShelfList")
+    links = sidebar.find_all("a") if sidebar else [a for a in soup.find_all("a") if not a.find_parent("tr")]
+    names = shelf_names_from(links)
+    if not names:
+        raise ScrapeError("no shelves found (private profile, or not signed in)")
+    return (m.group(1) if m else ""), names
+
+
 def scrape_profile(c: Client, item: dict) -> dict:
     soup = c.soup(f"{BASE}/user/show/{item['id']}")
     heading = soup.find(id="profileNameTopHeading")
-    if heading is None:
-        raise ScrapeError("not a reader profile (author page, or profile hidden)")
-    name = clean(heading.get_text(" ").split("\n")[0]) if heading else ""
-    shelves_box = soup.find("div", id="shelves")
-    shelf_names = []
-    for a in shelves_box.find_all("a") if shelves_box else []:
-        m = re.search(r"[?&](?:shelf|tag)=([^&]+)", a.get("href", ""))
-        if m and m.group(1) not in shelf_names:
-            shelf_names.append(m.group(1))
+    if heading is not None:
+        name = clean(heading.get_text(" ").split("\n")[0])
+        shelves_box = soup.find("div", id="shelves")
+        shelf_names = shelf_names_from(shelves_box.find_all("a") if shelves_box else [])
+    else:
+        # Goodreads authors: /user/show redirects to the author page, but their reader shelves still exist.
+        if not c.cookie:
+            raise ScrapeError("author account: profile page redirects to the author page; needs a cookie to read shelves")
+        name, shelf_names = profile_from_shelf_page(c, item["id"])
     if not c.cookie:
         print("    no cookie: profile info only, shelves skipped", file=sys.stderr)
         return {"name": name, "shelves": shelf_names, "books": []}
