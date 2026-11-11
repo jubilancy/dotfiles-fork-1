@@ -1,0 +1,406 @@
+#!/usr/bin/env -S uv run --script
+# /// script
+# requires-python = ">=3.10"
+# dependencies = ["requests", "beautifulsoup4"]
+# ///
+"""Batch-export Goodreads profiles, shelves and Listopia lists to JSON + CSV.
+
+    goodreads-scraper urls.txt [--out DIR] [--cookie-file FILE] [--max-pages N]
+
+Each non-blank, non-# line of the input file is one of:
+    143704182                                          profile (bare user id)
+    https://www.goodreads.com/user/show/143704182-x    profile
+    https://www.goodreads.com/review/list/143704182    profile (all shelves)
+    https://www.goodreads.com/review/list/143704182?shelf=read    one shelf/tag
+    https://www.goodreads.com/list/show/1.Best_Books_Ever         Listopia list
+
+Output, one JSON + one CSV per line, named <id>_<type>[-<shelf>]:
+    143704182_profile.json / .csv
+    143704182_shelf-read.json / .csv
+    1_list.json / .csv
+
+Profiles and shelves need your Goodreads session cookie (a Get cookies.txt
+export works as-is). Lists are public.
+"""
+
+from __future__ import annotations
+
+import argparse
+import csv
+import json
+import os
+import re
+import sys
+import time
+from datetime import datetime, timezone
+from pathlib import Path
+from urllib.parse import parse_qs, urlparse
+
+import requests
+from bs4 import BeautifulSoup, Tag
+
+BASE = "https://www.goodreads.com"
+PER_PAGE = 100
+DELAY = 1.0  # seconds between requests
+UA = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 Chrome/124 Safari/537.36"
+
+BOOK_COLUMNS = [
+    "book_id", "title", "author", "isbn", "isbn13", "asin", "num_pages",
+    "avg_rating", "num_ratings", "date_pub", "date_pub_edition", "my_rating",
+    "shelves", "exclusive_shelf", "read_count", "date_started", "date_read",
+    "date_added", "owned", "format", "review",
+]  # fmt: skip
+LIST_COLUMNS = [
+    "position", "book_id", "title", "author", "author_id", "avg_rating",
+    "num_ratings", "score", "votes", "url",
+]  # fmt: skip
+
+
+class ScrapeError(Exception):
+    pass
+
+
+# --------------------------------------------------------------------------- input
+
+
+def classify(line: str) -> dict:
+    """Turn one input line into {type, id, name, url}."""
+    raw = line.strip()
+    if re.fullmatch(r"\d+", raw):
+        return {"type": "profile", "id": raw, "name": None}
+    if re.match(r"^(www\.)?goodreads\.com", raw):
+        raw = "https://" + raw
+    u = urlparse(raw)
+    if "goodreads.com" not in u.netloc:
+        raise ScrapeError("not a goodreads.com URL or numeric id")
+    q = parse_qs(u.query)
+    if m := re.match(r"^/list/show/(\d+)", u.path):
+        return {"type": "list", "id": m.group(1), "name": None}
+    if m := re.match(r"^/review/list/(\d+)", u.path):
+        shelf = (q.get("shelf") or q.get("tag") or [None])[0]
+        if shelf:
+            return {"type": "shelf", "id": m.group(1), "name": shelf}
+        return {"type": "profile", "id": m.group(1), "name": None}
+    if m := re.match(r"^/user/show/(\d+)", u.path):
+        return {"type": "profile", "id": m.group(1), "name": None}
+    raise ScrapeError("unrecognised URL (want a profile, shelf or /list/show URL)")
+
+
+def read_cookie(path: Path | None) -> str | None:
+    """Cookie header string. Accepts a raw header value or a Netscape cookies.txt."""
+    if path is None:
+        return None
+    text = path.read_text().strip()
+    if "\t" not in text:
+        return text or None
+    pairs: dict[str, str] = {}
+    for l in text.splitlines():
+        l = l.removeprefix("#HttpOnly_")
+        p = l.split("\t")
+        if len(p) >= 7 and not l.startswith("#") and p[0].lstrip(".").endswith("goodreads.com"):
+            pairs[p[5]] = p[6]
+    return "; ".join(f"{k}={v}" for k, v in pairs.items()) or None
+
+
+# --------------------------------------------------------------------------- http
+
+
+class Client:
+    def __init__(self, cookie: str | None):
+        self.cookie = cookie
+        self.s = requests.Session()
+        self.s.headers["User-Agent"] = UA
+        if cookie:
+            self.s.headers["Cookie"] = cookie
+        self._last = 0.0
+
+    def soup(self, url: str, params: dict | None = None) -> BeautifulSoup:
+        for attempt in range(4):
+            wait = DELAY - (time.monotonic() - self._last)
+            if wait > 0:
+                time.sleep(wait)
+            self._last = time.monotonic()
+            try:
+                r = self.s.get(url, params=params, timeout=30)
+            except requests.RequestException:
+                if attempt == 3:
+                    raise ScrapeError(f"network error fetching {url}")
+                time.sleep(2**attempt * 2)
+                continue
+            if r.status_code == 494:
+                raise ScrapeError("HTTP 494: cookie header too large (use only goodreads.com cookies)")
+            if r.status_code in (429, 500, 502, 503, 504):
+                time.sleep(2**attempt * 3)
+                continue
+            if r.status_code >= 400:
+                raise ScrapeError(f"HTTP {r.status_code} for {r.url}")
+            if "/user/sign_in" in r.url or "/user/new" in r.url:
+                raise ScrapeError("redirected to sign-in: cookie missing, invalid or expired")
+            return BeautifulSoup(r.text, "html.parser")
+        raise ScrapeError(f"gave up after retries: {url}")
+
+
+# --------------------------------------------------------------------------- parsing
+
+
+def clean(text: str) -> str:
+    text = re.sub(r"\[edit\]", "", text)
+    return " ".join(text.split())
+
+
+def num(text: str) -> int | None:
+    m = re.search(r"\d[\d,]*", text or "")
+    return int(m.group(0).replace(",", "")) if m else None
+
+
+def flt(text: str) -> float | None:
+    m = re.search(r"\d+(?:\.\d+)?", text or "")
+    return float(m.group(0)) if m else None
+
+
+def _field(row: Tag, name: str) -> Tag | None:
+    cell = row.select_one(f"td.field.{name}")
+    return cell.select_one("div.value") if cell else None
+
+
+def _val(row: Tag, name: str) -> str:
+    v = _field(row, name)
+    return clean(v.get_text(" ")) if v else ""
+
+
+def parse_shelf_row(row: Tag) -> dict:
+    link = row.select_one("td.field.title a")
+    href = link.get("href", "") if link else ""
+    stars = row.select_one("td.field.rating .stars")
+    my_rating = int(float(stars["data-rating"])) if stars and stars.get("data-rating") else 0
+    author = _field(row, "author")
+    a = author.find("a") if author else None
+    date = lambda n: "" if _val(row, n) == "not set" else _val(row, n)  # noqa: E731
+    return {
+        "book_id": (re.search(r"/book/show/(\d+)", href) or [None, ""])[1],
+        "title": clean(link.get("title") or link.get_text(" ")) if link else "",
+        "author": clean(a.get_text(" ")) if a else "",
+        "isbn": _val(row, "isbn"),
+        "isbn13": _val(row, "isbn13"),
+        "asin": _val(row, "asin"),
+        "num_pages": num(_val(row, "num_pages")),
+        "avg_rating": flt(_val(row, "avg_rating")),
+        "num_ratings": num(_val(row, "num_ratings")),
+        "date_pub": _val(row, "date_pub"),
+        "date_pub_edition": _val(row, "date_pub_edition"),
+        "my_rating": my_rating or None,
+        "shelves": [clean(s.get_text()) for s in row.select("td.field.shelves a.shelfLink")],
+        "exclusive_shelf": None,
+        "read_count": num(_val(row, "read_count")),
+        "date_started": date("date_started"),
+        "date_read": date("date_read"),
+        "date_added": _val(row, "date_added"),
+        "owned": _val(row, "owned"),
+        "format": _val(row, "format"),
+        "review": "" if _val(row, "review") == "Write a review" else _val(row, "review"),
+    }
+
+
+def parse_list_row(row: Tag) -> dict:
+    title = row.select_one("a.bookTitle")
+    href = title.get("href", "") if title else ""
+    au = row.select_one("a.authorName")
+    au_href = au.get("href", "") if au else ""
+    rating = row.select_one("span.minirating")
+    rt = clean(rating.get_text(" ")) if rating else ""
+    m = re.search(r"([\d.]+) avg rating\D+([\d,]+) rating", rt)
+    text = clean(row.get_text(" "))
+    score = re.search(r"score:\s*([\d,]+)", text)
+    votes = re.search(r"([\d,]+)\s+people? voted", text)
+    pos = row.select_one("td.number")
+    return {
+        "position": num(pos.get_text()) if pos else None,
+        "book_id": (re.search(r"/book/show/(\d+)", href) or [None, ""])[1],
+        "title": clean(title.get_text(" ")) if title else "",
+        "author": clean(au.get_text(" ")) if au else "",
+        "author_id": (re.search(r"/author/show/(\d+)", au_href) or [None, ""])[1],
+        "avg_rating": float(m.group(1)) if m else None,
+        "num_ratings": int(m.group(2).replace(",", "")) if m else None,
+        "score": int(score.group(1).replace(",", "")) if score else None,
+        "votes": int(votes.group(1).replace(",", "")) if votes else None,
+        "url": BASE + href if href else "",
+    }
+
+
+_EXCLUSIVE_RE = re.compile(r"exclusive:\s*\[([^\]]*)\]")
+
+
+def exclusive_shelves(soup: BeautifulSoup) -> set[str]:
+    for script in soup.find_all("script"):
+        m = _EXCLUSIVE_RE.search(script.get_text())
+        if m:
+            return set(re.findall(r'"([^"]+)"', m.group(1)))
+    return set()
+
+
+# --------------------------------------------------------------------------- scraping
+
+
+def scrape_shelf_rows(c: Client, user_id: str, shelf: str) -> tuple[list[dict], set[str]]:
+    rows: list[dict] = []
+    exclusive: set[str] = set()
+    page = 1
+    while True:
+        # view=table pins the layout: Goodreads otherwise honours the account's saved view.
+        soup = c.soup(
+            f"{BASE}/review/list/{user_id}",
+            {"shelf": shelf, "page": page, "per_page": PER_PAGE, "print": "true", "view": "table"},
+        )
+        if page == 1:
+            exclusive = exclusive_shelves(soup)
+        body = soup.find("tbody", id="booksBody")
+        if body is None:
+            raise ScrapeError(f"shelf '{shelf}': book table not found (private profile or layout change)")
+        page_rows = body.select("tr.bookalike")
+        if not page_rows:
+            break
+        rows += [parse_shelf_row(r) for r in page_rows]
+        print(f"    {shelf}: {len(rows)} books", end="\r", file=sys.stderr)
+        if len(page_rows) < PER_PAGE:
+            break
+        page += 1
+    print(" " * 60, end="\r", file=sys.stderr)
+    return rows, exclusive
+
+
+def scrape_shelf(c: Client, item: dict) -> dict:
+    rows, exclusive = scrape_shelf_rows(c, item["id"], item["name"])
+    for r in rows:
+        if item["name"] in exclusive:
+            r["exclusive_shelf"] = item["name"]
+        if item["name"] not in r["shelves"]:
+            r["shelves"].append(item["name"])
+    return {"name": item["name"], "books": rows}
+
+
+def scrape_profile(c: Client, item: dict) -> dict:
+    soup = c.soup(f"{BASE}/user/show/{item['id']}")
+    heading = soup.find(id="profileNameTopHeading")
+    if heading is None:
+        raise ScrapeError("not a reader profile (author page, or profile hidden)")
+    name = clean(heading.get_text(" ").split("\n")[0]) if heading else ""
+    shelves_box = soup.find("div", id="shelves")
+    shelf_names = []
+    for a in shelves_box.find_all("a") if shelves_box else []:
+        m = re.search(r"[?&](?:shelf|tag)=([^&]+)", a.get("href", ""))
+        if m and m.group(1) not in shelf_names:
+            shelf_names.append(m.group(1))
+    if not c.cookie:
+        print("    no cookie: profile info only, shelves skipped", file=sys.stderr)
+        return {"name": name, "shelves": shelf_names, "books": []}
+
+    books: dict[str, dict] = {}
+    exclusive: set[str] = set()
+    for shelf in shelf_names:
+        rows, ex = scrape_shelf_rows(c, item["id"], shelf)
+        exclusive = exclusive or ex
+        for r in rows:
+            entry = books.setdefault(r["book_id"], {**r, "shelves": []})
+            if shelf not in entry["shelves"]:
+                entry["shelves"].append(shelf)
+            if shelf in exclusive:
+                entry["exclusive_shelf"] = shelf
+    return {"name": name, "shelves": shelf_names, "books": list(books.values())}
+
+
+def scrape_list(c: Client, item: dict, max_pages: int) -> dict:
+    books: list[dict] = []
+    title = ""
+    page = 1
+    while not max_pages or page <= max_pages:
+        soup = c.soup(f"{BASE}/list/show/{item['id']}", {"page": page})
+        if page == 1:
+            title = re.sub(r"\s*\(\d[\d,]* books?\)\s*$", "", soup.title.get_text().strip()) if soup.title else ""
+        rows = soup.select("table.tableList tr[itemtype]")
+        if not rows:
+            break
+        books += [parse_list_row(r) for r in rows]
+        print(f"    list {item['id']}: {len(books)} books", end="\r", file=sys.stderr)
+        if not soup.select_one("a.next_page"):
+            break
+        page += 1
+    print(" " * 60, end="\r", file=sys.stderr)
+    return {"name": title, "books": books}
+
+
+# --------------------------------------------------------------------------- output
+
+
+def safe(text: str) -> str:
+    return re.sub(r"[^\w.-]+", "_", text).strip("_")
+
+
+def write_outputs(out: Path, item: dict, source: str, data: dict) -> list[Path]:
+    stem = f"{item['id']}_{item['type']}" + (f"-{safe(item['name'])}" if item["type"] == "shelf" else "")
+    cols = LIST_COLUMNS if item["type"] == "list" else BOOK_COLUMNS
+    doc = {
+        "type": item["type"],
+        "id": item["id"],
+        "source": source,
+        "scraped_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+        **data,
+    }
+    jpath, cpath = out / f"{stem}.json", out / f"{stem}.csv"
+    jpath.write_text(json.dumps(doc, indent=2, ensure_ascii=False) + "\n")
+    with cpath.open("w", newline="", encoding="utf-8") as f:
+        w = csv.DictWriter(f, fieldnames=cols, extrasaction="ignore")
+        w.writeheader()
+        for b in data["books"]:
+            w.writerow({k: "; ".join(v) if isinstance(v, list) else ("" if v is None else v) for k, v in b.items()})
+    return [jpath, cpath]
+
+
+# --------------------------------------------------------------------------- main
+
+
+def main() -> int:
+    ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("input", type=Path, help="text file: one profile/shelf/list URL or user id per line")
+    ap.add_argument("--out", type=Path, default=Path("goodreads-out"), help="output directory (default: goodreads-out)")
+    ap.add_argument("--cookie-file", type=Path, help="cookie header text or Get cookies.txt export (default: $GOODREADS_COOKIE_FILE or ./gr_cookie.txt)")
+    ap.add_argument("--max-pages", type=int, default=0, help="Listopia lists only: stop after N pages (default: all)")
+    args = ap.parse_args()
+
+    cookie_path = args.cookie_file or (Path(p) if (p := os.environ.get("GOODREADS_COOKIE_FILE")) else None)
+    if cookie_path is None and Path("gr_cookie.txt").exists():
+        cookie_path = Path("gr_cookie.txt")
+    if cookie_path and not cookie_path.exists():
+        sys.exit(f"cookie file not found: {cookie_path}")
+    client = Client(read_cookie(cookie_path))
+    args.out.mkdir(parents=True, exist_ok=True)
+
+    lines = [l.strip() for l in args.input.read_text().splitlines()]
+    lines = [l for l in lines if l and not l.startswith("#")]
+    failures: list[tuple[str, str]] = []
+    for n, line in enumerate(lines, 1):
+        print(f"[{n}/{len(lines)}] {line}", file=sys.stderr)
+        try:
+            item = classify(line)
+            if item["type"] == "shelf" and not client.cookie:
+                raise ScrapeError("shelves need a cookie (--cookie-file)")
+            if item["type"] == "profile":
+                data = scrape_profile(client, item)
+            elif item["type"] == "shelf":
+                data = scrape_shelf(client, item)
+            else:
+                data = scrape_list(client, item, args.max_pages)
+            paths = write_outputs(args.out, item, line, data)
+            print(f"    -> {paths[0].name} ({len(data['books'])} books)", file=sys.stderr)
+        except ScrapeError as e:
+            print(f"    ✗ {e}", file=sys.stderr)
+            failures.append((line, str(e)))
+    if failures:
+        print(f"\n{len(failures)} of {len(lines)} failed:", file=sys.stderr)
+        for line, err in failures:
+            print(f"  {line}: {err}", file=sys.stderr)
+        return 1
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

@@ -78,6 +78,7 @@ export PATH=$PATH:$(go env GOPATH)/bin
 export PATH="$HOME/.cargo/bin:$PATH"
 export PATH="$PATH:$HOME/.istioctl/bin"
 export PATH="$HOME/bin:$PATH"
+export PATH="$HOME/dotfiles/bin:$PATH"  # goodreads-scraper, etc.
 export PATH=$PATH:/usr/local/go/bin
 export PATH=$PATH:~/go/bin
 export PATH=$PATH:$HOME/.poetry/bin
